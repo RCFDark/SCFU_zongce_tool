@@ -1,9 +1,9 @@
-# 综测证明图合成工具
+# 华南金融大学综测证明图片合成工具
 
 把 PDF 的**首页**和**姓名所在页**左右拼接成一张图，方便交综测证明。
 纯前端工具，**所有处理都在你自己的浏览器里完成，PDF 不会被上传到任何服务器**。
 
-在线使用：<https://rcfdark.github.io/GDUF_zongce_tool/>
+在线使用：<https://rcfdark.github.io/SCFU_zongce_tool/>
 
 ---
 
@@ -86,8 +86,8 @@
 ## 本地使用 / 部署
 
 ```bash
-git clone https://github.com/RCFDark/GDUF_zongce_tool.git
-cd GDUF_zongce_tool
+git clone https://github.com/RCFDark/SCFU_zongce_tool.git
+cd SCFU_zongce_tool
 # 直接用 Chrome 打开 index.html 即可，无需构建、无需 npm
 ```
 
