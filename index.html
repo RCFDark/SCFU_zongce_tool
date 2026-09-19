@@ -218,6 +218,7 @@
   .auto-form{display:flex;gap:16px;flex-wrap:wrap;align-items:center;}
   .auto-form label{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);}
   .auto-form input[type=text]{width:180px;}
+  .auto-form input#ocrCollege{width:220px;}
   .auto-tip{margin:0;font-size:12.5px;color:var(--muted);line-height:1.75;}
   .auto-tip b{color:#a9c6ff;}
   .auto-progress{display:flex;flex-direction:column;gap:7px;}
@@ -399,6 +400,9 @@
         <label>我的姓名
           <input type="text" id="ocrName" placeholder="填写材料上的姓名" autocomplete="off">
         </label>
+        <label>学院关键词
+          <input type="text" id="ocrCollege" placeholder="可选，如：金融数学与统计学院" autocomplete="off">
+        </label>
         <label>识别精度
           <select id="ocrQuality">
             <option value="1400">标准（推荐）</option>
@@ -411,6 +415,11 @@
         程序会<b>逐份扫描 PDF</b>：先在文字层里直接找（电子版秒过），找不到就用 OCR 识别后定位姓名，
         自动画框并保存到 <b>合成结果</b>（不建类型子文件夹）。
         识别不到的会标记为「需手动」，跑完后自动跳到那一份，你在右侧手动框一下即可。
+      </p>
+      <p class="auto-tip" style="margin-top:6px">
+        填了<b>学院关键词</b>会先做一轮<b>快扫</b>：每页只认一部分框（先认长文本抓学院，再认姓名形状顺带碰名字），
+        命中学院后只精查它前后各 2 页，而且<b>快扫时撞到名字就直接定位</b>——页数多的名单能快不少。
+        <b>没填、或没扫到学院</b>时自动退回逐页全扫，结果不受影响。
       </p>
       <div class="auto-progress">
         <div class="bar"><i id="autoBar"></i></div>
@@ -1388,32 +1397,194 @@ async function renderPageForOcr(num, longSide){
   return cv;
 }
 
-/** 在某一页里找姓名；返回 {page, rect, via, ...} 或 null */
-async function findNameOnPage(pageNum, total){
-  var name = OCR.dlg.name;
-  var pg = await S.doc.getPage(pageNum);
+/* ---------- 两级定位：低分辨率快扫学院 → 只精查命中页附近 ---------- */
 
-  // ① 文字层（仅正向页面）
-  if ((pg.rotate % 180) === 0){
-    var tl = await textLayerFind(pg, name);
-    if (tl) return { page: pageNum, rect: PPOCR.padRect(tl), via: '文字层' };
+var COLLEGE_RADIUS = 2;        // 学院命中页前后各取几页作为候选
+var FAST_LONG_SIDE = 1200;     // 快扫渲染长边（略低于标准，省的主要是渲染时间）
+var FAST_SCAN_MIN_PAGES = 12;  // 少于这个页数直接精查：快扫省下的不够抵消它自己的开销
+var FAST_SCAN_RATIO = 0.4;     // 快扫每页只认这么大比例的框（少量长框抓学院 + 姓名形状框抓名字）
+var COLLEGE_MIN_RATIO = 0.75;  // 模糊匹配阈值：低分辨率 OCR 常有错字，不能只做严格包含
+
+function itemsJoinedText(items){
+  var s = '';
+  for (var i = 0; i < items.length; i++) s += (items[i].text || '');
+  return PPOCR.normText(s);
+}
+
+/** 模糊包含：等长滑窗求最大字符命中率，容忍 OCR 错字（如「学院」被认成「学皖」） */
+function fuzzyContains(text, key, minRatio){
+  var a = PPOCR.normText(text), b = PPOCR.normText(key);
+  if (!a || !b) return false;
+  if (a.indexOf(b) >= 0) return true;
+  if (b.length < 4) return false;
+  var need = Math.ceil(b.length * (minRatio || COLLEGE_MIN_RATIO));
+  var best = 0;
+  for (var i = 0; i + b.length <= a.length; i++){
+    var same = 0;
+    for (var j = 0; j < b.length; j++){ if (a[i + j] === b[j]) same++; }
+    if (same > best){ best = same; if (best >= need) return true; }
+  }
+  return false;
+}
+
+function distToPages(p, hits){
+  var d = Infinity;
+  for (var i = 0; i < hits.length; i++) d = Math.min(d, Math.abs(p - hits[i]));
+  return d;
+}
+
+/** 学院命中页 ±radius 作为候选，按「离最近命中页的距离」排序（近的先查） */
+function buildCandidateOrder(hits, totalPages, radius){
+  var seen = {}, out = [];
+  for (var i = 0; i < hits.length; i++){
+    var lo = Math.max(1, hits[i] - radius), hi = Math.min(totalPages, hits[i] + radius);
+    for (var p = lo; p <= hi; p++){ if (!seen[p]){ seen[p] = 1; out.push(p); } }
+  }
+  out.sort(function(a, b){
+    var da = distToPages(a, hits), db = distToPages(b, hits);
+    return da !== db ? da - db : a - b;
+  });
+  return out;
+}
+
+async function pagePlainText(doc, num){
+  try{
+    var pg = await doc.getPage(num);
+    var tc = await pg.getTextContent();
+    var s = '';
+    for (var i = 0; i < (tc.items || []).length; i++) s += (tc.items[i].str || '');
+    return PPOCR.normText(s);
+  }catch(e){ return ''; }
+}
+
+/** 有文字层的电子版：一次性把整篇文本拉出来；纯扫描件返回 null */
+async function docTextPages(doc, total){
+  var first = await pagePlainText(doc, 1);
+  if (!first || first.length < 20) return null;
+  var arr = [first];
+  for (var n = 2; n <= total; n++) arr.push(await pagePlainText(doc, n));
+  return arr;
+}
+
+/** 对单页做一次 OCR 找姓名；返回命中详情或 null
+ *  加速点：检测出所有框后，先认「形状像姓名」的框（宽度≈2~4 字），命中即停 */
+async function ocrFindNameOnPage(pageNum, longSide){
+  var t0 = Date.now();
+  var cv = await renderPageForOcr(pageNum, longSide);
+  var d = await PPOCR.detect(cv, {});
+  var order = PPOCR.orderByNameShape(d.boxes);
+  var r = await PPOCR.recognize(cv, d.boxes, order, {
+    batchSize: 8,
+    onBatch: function(acc){ return !!PPOCR.findName(acc, OCR.dlg.name); }
+  });
+  var hit = PPOCR.findName(r.items, OCR.dlg.name);
+  if (!hit) return null;
+  return {
+    page: pageNum, rect: PPOCR.padRect(PPOCR.hitToRect(hit, cv.width, cv.height)),
+    via: 'OCR', kind: hit.kind,
+    text: hit.items.map(function(x){ return x.text; }).join('|'),
+    score: hit.items[0] ? hit.items[0].score : null,
+    boxes: r.items.length, totalBoxes: d.boxes.length, ms: Math.round(Date.now() - t0)
+  };
+}
+
+/**
+ * 在整份 PDF 里定位姓名。
+ * ① 文字层直读（电子版秒过）→ ② 填了学院就先低分辨率快扫定位学院 → ③ 只精查候选页；
+ *    没填学院 / 没扫到学院 → 退回逐页全扫，结果不受影响。
+ */
+async function locateNameInDoc(p){
+  var total = p.total, name = OCR.dlg.name, college = OCR.dlg.college;
+  var note = [], n;
+
+  /* ① 文字层：电子版几乎零成本，整篇文本一次拉完 */
+  var texts = await docTextPages(S.doc, total);
+  if (texts){
+    var order = [];
+    if (college){
+      var ch = [];
+      for (n = 1; n <= total; n++){ if (fuzzyContains(texts[n - 1], college, COLLEGE_MIN_RATIO)) ch.push(n); }
+      if (ch.length){
+        order = buildCandidateOrder(ch, total, COLLEGE_RADIUS);
+        note.push('文字层学院命中 ' + ch.length + ' 页 → 先看 ' + order.length + ' 页');
+      }
+    }
+    if (!order.length){ for (n = 1; n <= total; n++) order.push(n); }
+    for (var i1 = 0; i1 < order.length; i1++){
+      var tl = await textLayerFind(await S.doc.getPage(order[i1]), name);
+      if (tl) return { page: order[i1], rect: PPOCR.padRect(tl), via: '文字层', note: note.join('；') || '文字层直读' };
+    }
+    note.push('文字层无此姓名');
   }
 
-  // ② OCR
-  var cv = await renderPageForOcr(pageNum, OCR.dlg.longSide);
-  var r = await PPOCR.runPage(cv, {
-    batchSize: 6,
-    onBatch: function(acc){ return !!PPOCR.findName(acc, name); }
-  });
-  var hit = PPOCR.findName(r.items, name);
-  if (hit){
-    var rect = PPOCR.padRect(PPOCR.hitToRect(hit, cv.width, cv.height));
-    return {
-      page: pageNum, rect: rect, via: 'OCR',
-      kind: hit.kind, text: hit.items.map(function(x){ return x.text; }).join('|'),
-      score: hit.items[0] ? hit.items[0].score : null,
-      boxes: r.items.length, totalBoxes: r.ms.boxes, ms: Math.round(r.ms.total)
-    };
+  /* ② 学院快扫：每页只认一部分框（长文本优先抓学院，其次姓名形状顺带抓名字） */
+  var collegeHits = null, candidates = null;
+  if (college && total >= FAST_SCAN_MIN_PAGES){
+    autoLog('   · 学院快扫「' + college + '」（' + total + ' 页，每页先认长框抓学院、再认姓名框碰运气）', 'mut');
+    var hits = [], quickName = null;
+    var BATCH = 8;
+    for (n = 1; n <= total; n++){
+      if (OCR.dlg.stop) throw new Error('__stopped__');
+      var cv = await renderPageForOcr(n, FAST_LONG_SIDE);
+      var d = await PPOCR.detect(cv, {});
+      var gotName = false, gotCollege = false;
+      await PPOCR.recognize(cv, d.boxes, PPOCR.orderMixed(d.boxes, FAST_SCAN_RATIO), {
+        batchSize: BATCH,
+        onBatch: function(acc){
+          if (!gotName && PPOCR.findName(acc, name)) gotName = true;
+          if (!gotCollege && fuzzyContains(itemsJoinedText(acc), college, COLLEGE_MIN_RATIO)) gotCollege = true;
+          return gotName || gotCollege;   // 命中任一即停
+        }
+      });
+      if (gotCollege) hits.push(n);
+      if (gotName && quickName === null) quickName = n;
+      await sleep(0);
+    }
+    if (hits.length){
+      collegeHits = hits;
+      candidates = buildCandidateOrder(hits, total, COLLEGE_RADIUS);
+      note.push('学院命中第 ' + hits.join('、') + ' 页 → 精查 ' + candidates.length + ' 页');
+      autoLog('   · 学院命中 ' + hits.length + ' 页（' + hits.join('、') + '）→ 精查 ' + candidates.length + ' 页', 'ok');
+    } else {
+      note.push('未扫到学院 → 逐页全扫');
+      autoLog('   · 未扫到学院，改为逐页全扫', 'mut');
+    }
+    // 快扫顺带看到了姓名 → 用正常精度重扫这一页取准坐标
+    if (quickName){
+      var q = await ocrFindNameOnPage(quickName, OCR.dlg.longSide);
+      if (q){
+        q.note = note.join('；') + '；快扫顺带命中';
+        q.collegeHits = collegeHits; q.candidatePages = candidates ? candidates.length : total;
+        return q;
+      }
+    }
+  }
+
+  /* ③ 精查：候选页优先；候选里没有就把其余页补扫完，保证不漏 */
+  var order2 = [], candSet = {};
+  if (candidates && candidates.length){
+    for (var c1 = 0; c1 < candidates.length; c1++){ candSet[candidates[c1]] = 1; order2.push(candidates[c1]); }
+    for (n = 1; n <= total; n++){ if (!candSet[n]) order2.push(n); }
+  } else {
+    for (n = 1; n <= total; n++) order2.push(n);
+  }
+  var inCandidate = true;
+  for (var i2 = 0; i2 < order2.length; i2++){
+    if (OCR.dlg.stop) throw new Error('__stopped__');
+    var pn = order2[i2];
+    if (candidates && candidates.length && !candSet[pn] && inCandidate){
+      inCandidate = false;
+      autoLog('   · 候选页都没找到，补扫其余 ' + (order2.length - i2) + ' 页', 'mut');
+    }
+    var pt = Date.now();
+    var res = await ocrFindNameOnPage(pn, OCR.dlg.longSide);
+    if (res){
+      res.note = note.join('；') || (candidates ? '学院筛选后命中' : '逐页命中');
+      res.collegeHits = collegeHits;
+      res.candidatePages = order2.length;
+      return res;
+    }
+    if (total > 3) autoLog('   · 第 ' + pn + '/' + total + ' 页未命中（' + ((Date.now() - pt) / 1000).toFixed(1) + 's）', 'mut');
   }
   return null;
 }
@@ -1455,6 +1626,7 @@ async function autoRunAll(){
   if (!S.pdfs.length){ toast('请先选择存放 PDF 的文件夹', 'warn', 3200); return; }
 
   OCR.dlg.name = name;
+  OCR.dlg.college = ($('ocrCollege') && $('ocrCollege').value || '').trim();
   OCR.dlg.longSide = parseInt($('ocrQuality').value, 10) || 1400;
   OCR.dlg.stop = false;
   OCR.dlg.running = true;
@@ -1490,17 +1662,7 @@ async function autoRunAll(){
       try{
         await loadDoc(p);
         p.total = S.doc.numPages;
-        var hit = null;
-        for (var num = 1; num <= p.total; num++){
-          if (OCR.dlg.stop) throw new Error('__stopped__');
-          var pageT0 = Date.now();
-          hit = await findNameOnPage(num, p.total);
-          if (hit) break;
-          if (p.total > 3){
-            autoLog('   · 第 ' + num + '/' + p.total + ' 页未命中（' + ((Date.now() - pageT0) / 1000).toFixed(1) + 's）', 'mut');
-          }
-        }
-        found = hit;
+        found = await locateNameInDoc(p);
       }catch(e){
         if (e && e.message === '__stopped__'){ autoLog('⏹ 已停止', 'warn'); break; }
         reason = e && e.message ? e.message : String(e);
@@ -1534,6 +1696,7 @@ async function autoRunAll(){
         p.existingIn = NO_TYPE;
         okCount++;
         var extra = found.via === 'OCR' ? '（OCR 扫描 ' + found.boxes + ' 框 / 共 ' + found.totalBoxes + '）' : '（文字层直读）';
+        if (found.note) extra += ' · ' + found.note;
         autoLog('   ✔ 姓名在第 ' + found.page + ' 页 ' + extra + ' → ' + OUT_FOLDER + '/' + fname, 'ok');
       }catch(e){
         p.status = 'failed';
@@ -1572,6 +1735,9 @@ function openAutoModal(){
   if (!$('ocrName').value){
     try{ $('ocrName').value = localStorage.getItem('ppocr_name') || ''; }catch(e){}
   }
+  if (!$('ocrCollege').value){
+    try{ $('ocrCollege').value = localStorage.getItem('ppocr_college') || ''; }catch(e){}
+  }
   $('ocrName').focus();
 }
 
@@ -1581,7 +1747,10 @@ $('btnAutoClose').addEventListener('click', function(){
   $('autoModal').classList.add('hidden');
 });
 $('btnAutoStart').addEventListener('click', function(){
-  try{ localStorage.setItem('ppocr_name', ($('ocrName').value || '').trim()); }catch(e){}
+  try{
+    localStorage.setItem('ppocr_name', ($('ocrName').value || '').trim());
+    localStorage.setItem('ppocr_college', ($('ocrCollege').value || '').trim());
+  }catch(e){}
   autoRunAll();
 });
 $('btnAutoStop').addEventListener('click', function(){
@@ -1602,6 +1771,9 @@ $('autoModal').addEventListener('click', function(e){
   if (e.target === this && !OCR.dlg.running) this.classList.add('hidden');
 });
 $('ocrName').addEventListener('keydown', function(e){
+  if (e.key === 'Enter'){ e.stopPropagation(); $('btnAutoStart').click(); }
+});
+$('ocrCollege').addEventListener('keydown', function(e){
   if (e.key === 'Enter'){ e.stopPropagation(); $('btnAutoStart').click(); }
 });
 

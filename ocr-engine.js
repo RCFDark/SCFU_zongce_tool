@@ -322,42 +322,37 @@ var PPOCR = (function () {
 
   /* --------------------------------------------------------------- 主入口 */
 
-  /**
-   * 对整页 canvas 做 OCR。
-   * @param srcCanvas 页面画布（原图分辨率，用于裁剪识别）
-   * @param opts {
-   *   batchSize    识别批大小，默认 6
-   *   detMaxSide   检测输入的最长边上限（只影响框定位精度，不影响识别清晰度）
-   *   onBatch(items) 每识别完一批回调；返回 true 可提前停止（命中即停）
-   *   onProgress(done,total)
-   * }
-   * @returns { items:[{text,score,x0,y0,x1,y1}], ms:{det,rec,total,stoppedEarly} }
-   */
-  async function runPage(srcCanvas, opts) {
+  /** 只做检测：返回文本框（不做识别） */
+  async function detect(srcCanvas, opts) {
     opts = opts || {};
     if (!ready) throw new Error('OCR 引擎尚未初始化');
-
-    var t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-
+    var t0 = now();
     var pre = detPreprocess(srcCanvas, opts.detMaxSide);
     var feeds = {};
     feeds[detSession.inputNames[0]] = new ort.Tensor('float32', pre.data, [1, 3, pre.rh, pre.rw]);
     var detOut = await detSession.run(feeds);
     var probTensor = detOut[detSession.outputNames[0]] || detOut[Object.keys(detOut)[0]];
-    var prob = probTensor.data;
-    var t1 = now();
+    var d = detPostprocess(probTensor.data, pre.rw, pre.rh, pre.ow, pre.oh);
+    return { boxes: d.boxes, scores: d.scores, ms: now() - t0 };
+  }
 
-    var det = detPostprocess(prob, pre.rw, pre.rh, pre.ow, pre.oh);
-    var boxes = det.boxes;
+  /**
+   * 按给定顺序识别检测框。
+   * @param order 框索引的识别顺序（null = 检测原始顺序）；配合 onBatch 早停可少认很多框
+   */
+  async function recognize(srcCanvas, boxes, order, opts) {
+    opts = opts || {};
+    var idxAll = [];
+    var i;
+    for (i = 0; i < boxes.length; i++) idxAll.push(i);
+    if (order && order.length) idxAll = order.slice();
 
     var batchSize = Math.max(1, opts.batchSize || REC.BATCH);
-    var items = [];
-    var stoppedEarly = false;
-    var t2 = now();
+    var items = [], stoppedEarly = false, t0 = now();
 
-    for (var s = 0; s < boxes.length; s += batchSize) {
+    for (var s = 0; s < idxAll.length; s += batchSize) {
       var idxs = [];
-      for (var q = s; q < Math.min(s + batchSize, boxes.length); q++) idxs.push(q);
+      for (var q = s; q < Math.min(s + batchSize, idxAll.length); q++) idxs.push(idxAll[q]);
       var prep = recPrepareBatch(srcCanvas, boxes, idxs);
       var f = {};
       f[recSession.inputNames[0]] = new ort.Tensor('float32', prep.data, prep.dims);
@@ -368,23 +363,97 @@ var PPOCR = (function () {
       for (var k = 0; k < idxs.length; k++) {
         if (!dec[k].text) continue;
         var b = boxes[idxs[k]];
-        items.push({
-          text: dec[k].text, score: dec[k].score,
-          x0: b[0], y0: b[1], x1: b[2], y1: b[3],
-          detScore: det.scores[idxs[k]]
-        });
+        items.push({ text: dec[k].text, score: dec[k].score, x0: b[0], y0: b[1], x1: b[2], y1: b[3] });
       }
-      if (opts.onProgress) opts.onProgress(Math.min(s + batchSize, boxes.length), boxes.length);
+      if (opts.onProgress) opts.onProgress(Math.min(s + batchSize, idxAll.length), idxAll.length);
       if (opts.onBatch && opts.onBatch(items) === true) { stoppedEarly = true; break; }
       await yield0();
     }
-    var t3 = now();
-
     return {
       items: items,
-      ms: { det: t1 - t0, rec: t3 - t2, total: t3 - t0, boxes: boxes.length, stoppedEarly: stoppedEarly },
-      det: det
+      recognized: Math.min(items.length ? idxAll.length : 0, idxAll.length),
+      ms: { rec: now() - t0, boxes: boxes.length, stoppedEarly: stoppedEarly }
     };
+  }
+
+  /**
+   * 对整页 canvas 做 OCR。
+   * @param srcCanvas 页面画布（原图分辨率，用于裁剪识别）
+   * @param opts {
+   *   batchSize    识别批大小，默认 6
+   *   detMaxSide   检测输入的最长边上限
+   *   order        框的识别顺序（索引数组），不传则按检测顺序
+   *   onBatch(items) 每识别完一批回调；返回 true 可提前停止（命中即停）
+   *   onProgress(done,total)
+   * }
+   */
+  async function runPage(srcCanvas, opts) {
+    opts = opts || {};
+    var t0 = now();
+    var d = await detect(srcCanvas, opts);
+    var r = await recognize(srcCanvas, d.boxes, opts.order || null, opts);
+    return {
+      items: r.items,
+      ms: { det: d.ms, rec: r.ms.rec, total: now() - t0, boxes: d.boxes.length, stoppedEarly: r.ms.stoppedEarly },
+      det: d
+    };
+  }
+
+  /* ------------------------------------------------- 识别顺序（早停加速） */
+
+  function medianHeights(boxes) {
+    var hs = [];
+    for (var i = 0; i < boxes.length; i++) hs.push(Math.max(1, boxes[i][3] - boxes[i][1]));
+    hs.sort(function (a, b) { return a - b; });
+    return hs.length ? hs[(hs.length / 2) | 0] : 12;
+  }
+
+  /** 姓名形状优先：按「宽度 ≈ 2~4 个字」的程度排序，最像的先认 */
+  function orderByNameShape(boxes) {
+    var med = medianHeights(boxes), i;
+    var idx = [];
+    for (i = 0; i < boxes.length; i++) idx.push(i);
+    idx.sort(function (a, b) {
+      var wa = (boxes[a][2] - boxes[a][0]) / med;
+      var wb = (boxes[b][2] - boxes[b][0]) / med;
+      // 目标 ≈3 字宽（2~4 个汉字）；同分时按页面中位置从上到下
+      var sa = Math.abs(wa - 3), sb = Math.abs(wb - 3);
+      if (Math.abs(sa - sb) > 0.15) return sa - sb;
+      return boxes[a][1] - boxes[b][1];
+    });
+    return idx;
+  }
+
+  /** 长文本优先：学院名、标题这类长串先认 */
+  function orderByLongText(boxes) {
+    var idx = [];
+    for (var i = 0; i < boxes.length; i++) idx.push(i);
+    idx.sort(function (a, b) {
+      return (boxes[b][2] - boxes[b][0]) - (boxes[a][2] - boxes[a][0]);
+    });
+    return idx;
+  }
+
+  /**
+   * 快扫用：先认最长的一小撮（抓学院/标题，命中就早停），
+   * 其余按姓名形状排（顺带抓名字），总数控制在 ratio 以内。
+   * @param ratio 只返回前 ratio 比例的框索引，认完即止
+   */
+  function orderMixed(boxes, ratio) {
+    if (!boxes.length) return [];
+    var n = boxes.length;
+    // 至少认 12 个框：封面这类框很少的页，按比例算出来会少到连标题都认不到
+    var total = Math.min(n, Math.max(12, Math.round(n * (ratio || 0.4))));
+    var longN = Math.min(Math.max(1, total - 1), Math.max(2, Math.round(n * 0.15)));
+
+    var longPart = orderByLongText(boxes).slice(0, longN);
+    var namePart = orderByNameShape(boxes);
+    var seen = {}, out = [], i;
+    for (i = 0; i < longPart.length; i++) { seen[longPart[i]] = 1; out.push(longPart[i]); }
+    for (i = 0; i < namePart.length && out.length < total; i++) {
+      if (!seen[namePart[i]]) out.push(namePart[i]);
+    }
+    return out;
   }
 
   function now() {
@@ -463,7 +532,12 @@ var PPOCR = (function () {
     setOrt: setOrt,
     initModels: initModels,
     isReady: isReady,
+    detect: detect,
+    recognize: recognize,
     runPage: runPage,
+    orderByNameShape: orderByNameShape,
+    orderByLongText: orderByLongText,
+    orderMixed: orderMixed,
     findName: findName,
     hitToRect: hitToRect,
     padRect: padRect,
