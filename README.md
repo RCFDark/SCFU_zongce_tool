@@ -44,12 +44,15 @@
 ### 关于加载
 
 - 首次使用需下载约 **21MB** 模型（检测 4.8MB + 识别 16.6MB），之后浏览器会本地缓存，不再重复下载。
-- 引擎自动在「本目录 → GitHub Pages → jsDelivr」之间择优回退加载。
+- 脚本（`ocr-engine.js` / `ort.min.js` / `charset.js`）按「本目录 → GitHub Pages → jsDelivr」加载，**本目录永远优先**：一来保证脚本与页面同版本，二来 `ort` 的 wasm worker 只能同源加载，跨域会直接报 `Failed to construct 'Worker'`。
+- 二进制（`.wasm` / `.onnx`）在 `file://` 下浏览器不允许 fetch 本地文件，只能走线上（同样可被缓存）。
+- 引擎加载后会**校验接口**：拿到的是旧版（缺 `detect` / `recognize` 等）就自动跳到下一个地址，并给出明确提示——不会再出现 `PPOCR.detect is not a function` 这种版本错位。
 - 页面首次打开会注册一个 Service Worker 来开启**跨源隔离**，从而让 onnxruntime 用多线程推理（约 2~3 倍提速）；首次会自动刷新一次，属正常现象。
 - 若浏览器不支持多线程，会自动退化为单线程，功能不受影响，只是慢一些。
 
-> 双击本地 html 文件（`file://`）也能用自动识别：此时模型会自动从线上地址加载，
-> 因此**需要联网**（手动模式完全离线可用）。想要完全离线，请把 html 与
+> 双击本地 html 文件（`file://`）也能用自动识别：此时**脚本用同目录的、模型从线上加载**，
+> 因此只需保证 `ocr-engine.js`、`charset.js`、`ort.min.js` 与 html 同目录，且**联网**即可
+> （手动模式完全离线可用）。想要完全离线，请把 html 与
 > `ocr-engine.js`、`charset.js`、`ocr-det.onnx`、`ocr-rec.onnx`、`ort.min.js`、
 > `ort-wasm-simd-threaded.mjs`、`ort-wasm-simd-threaded.wasm` 放同一目录，
 > 再用 Chrome 以 `--allow-file-access-from-files` 启动，或用任意静态服务器打开。

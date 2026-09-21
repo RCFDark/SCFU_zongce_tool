@@ -1177,8 +1177,9 @@ if (!SUPPORTED){
  *   ort.min.js / ort-wasm-simd-threaded.mjs / ort-wasm-simd-threaded.wasm —— onnxruntime-web
  *   charset.js / ocr-det.onnx / ocr-rec.onnx                       —— 字符表 + 检测/识别模型
  *
- * 注意：onnxruntime 的 .wasm 必须经 fetch 加载，file:// 下浏览器会拦截，
- *       因此本地双击打开时自动跳过「同目录」、直接走线上地址（模型同样可被缓存）。
+ * 注意：onnxruntime 的 .wasm、模型 .onnx 必须经 fetch 加载，file:// 下浏览器会拦截，
+ *       因此本地双击打开时，「脚本」优先用同目录的、二进制走线上地址（模型同样可被缓存）。
+ *       脚本与页面必须同版本：引擎加载后会校验接口，缺接口（旧版）就自动换下一个地址。
  */
 
 var OCR_DET_FILE = 'ocr-det.onnx';
@@ -1190,31 +1191,61 @@ var OCR_BASES = [
   'https://cdn.jsdelivr.net/gh/RCFDark/SCFU_zongce_tool@main/'
 ];
 
+/* 脚本版本号：只加在 http(s) 的 .js 上，用来击穿浏览器 / CDN 的旧缓存。
+ * 以后改了脚本想立刻生效，把这个串改一下即可（20MB 模型不受影响，照旧走缓存）。 */
+var OCR_SCRIPT_VER = '20260921';
+
 var OCR = {
   ready: false,
   loading: false,
-  base: null,
+  base: null,          // 取到「模型 / wasm」的地址（二进制只能走 http(s)）
+  scriptBase: null,    // 取到「脚本」的地址
   threads: 1,
   dlg: { open: false, running: false, stop: false, name: '', longSide: 1400 }
 };
 
-/* file:// 下不能用本地目录（fetch 受限），只保留 http(s) 地址 */
-function ocrUsableBases(){
+/* 引擎必须具备的接口。少任何一个都说明拿到的是旧版 ocr-engine.js，必须换下一个地址，
+ * 否则页面会出现「PPOCR.detect is not a function」这类版本错位。 */
+var OCR_ENGINE_API = [
+  'setOrt', 'initModels', 'detect', 'recognize',
+  'findName', 'hitToRect', 'padRect', 'normText'
+];
+
+function ocrEngineMissingApi(){
+  var P = window.PPOCR, miss = [];
+  for (var i = 0; i < OCR_ENGINE_API.length; i++){
+    if (!P || typeof P[OCR_ENGINE_API[i]] !== 'function') miss.push(OCR_ENGINE_API[i]);
+  }
+  return miss;
+}
+
+/* 上次成功过的地址优先（省掉重复的超时等待），但「本目录」永远第一：
+ * 脚本与页面同版本，而且 ort 的 wasm worker 只能同源加载，跨域会直接报
+ * 「Failed to construct 'Worker'」。 */
+function ocrBaseOrder(bases, key){
+  var last = null;
+  try{ last = localStorage.getItem(key); }catch(e){}
+  if (last && bases.indexOf(last) >= 0){
+    bases = [last].concat(bases.filter(function(b){ return b !== last; }));
+  }
+  var i = bases.indexOf('./');
+  if (i > 0){ bases.splice(i, 1); bases.unshift('./'); }
+  return bases;
+}
+
+/* 脚本：<script src> 不受 file:// 的 fetch 限制，所以本地目录始终参与。
+ * 这样双击打开时用的是随文件一起分发的引擎，不会「新页面配线上旧引擎」。 */
+function ocrScriptBases(){
+  return ocrBaseOrder(OCR_BASES.slice(), 'ppocr_sbase');
+}
+
+/* 二进制（ort 的 .wasm / .onnx 模型）必须经 fetch：file:// 下不能用本地目录 */
+function ocrBinaryBases(){
   var bases = OCR_BASES.slice();
   if (location.protocol === 'file:'){
     bases = bases.filter(function(b){ return /^https?:/i.test(b); });
   }
-  return bases;
-}
-
-function ocrBaseOrder(){
-  var bases = ocrUsableBases();
-  var last = null;
-  try{ last = localStorage.getItem('ppocr_base'); }catch(e){}
-  if (last && bases.indexOf(last) >= 0){
-    return [last].concat(bases.filter(function(b){ return b !== last; }));
-  }
-  return bases;
+  return ocrBaseOrder(bases, 'ppocr_base');
 }
 
 function ocrRememberBase(b){
@@ -1222,10 +1253,21 @@ function ocrRememberBase(b){
   OCR.base = b;
 }
 
+function ocrRememberScriptBase(b){
+  try{ localStorage.setItem('ppocr_sbase', b); }catch(e){}
+  OCR.scriptBase = b;
+}
+
+/* file:// 下不加 query：部分浏览器对带 query 的本地路径处理不一致 */
+function ocrVerUrl(url){
+  if (!/^https?:/i.test(url)) return url;
+  return url + (url.indexOf('?') < 0 ? '?' : '&') + 'v=' + OCR_SCRIPT_VER;
+}
+
 function ocrLoadScript(url){
   return new Promise(function(res, rej){
     var s = document.createElement('script');
-    s.src = url;
+    s.src = ocrVerUrl(url);
     if (/^https?:\/\//i.test(url) && url.indexOf(location.origin + '/') !== 0){
       s.crossOrigin = 'anonymous';    // 开启跨源隔离后，跨域脚本必须是 CORS 请求
     }
@@ -1253,21 +1295,26 @@ async function ocrFetchBuf(url){
   return await r2.arrayBuffer();
 }
 
-async function ocrLoadScriptFromBases(file){
-  var errs = [], bases = ocrBaseOrder();
+async function ocrLoadScriptFromBases(file, verify){
+  var errs = [], bases = ocrScriptBases();
   if (!bases.length) throw new Error('没有可用的资源地址');
   for (var i = 0; i < bases.length; i++){
+    var url = bases[i] + file;
     try{
-      await ocrLoadScript(bases[i] + file);
-      ocrRememberBase(bases[i]);
+      await ocrLoadScript(url);
+      if (verify && !verify()){
+        errs.push('· ' + url + '（版本过旧）');
+        continue;                                   // 接口对不上：换下一个地址再试
+      }
+      ocrRememberScriptBase(bases[i]);
       return bases[i];
-    }catch(e){ errs.push('· ' + bases[i] + file); }
+    }catch(e){ errs.push('· ' + url + '（' + (e && e.message || e) + '）'); }
   }
   throw new Error('加载 ' + file + ' 失败，已尝试：\n' + errs.join('\n'));
 }
 
 async function ocrLoadBinaryFromBases(file){
-  var errs = [], bases = ocrBaseOrder();
+  var errs = [], bases = ocrBinaryBases();
   if (!bases.length) throw new Error('没有可用的资源地址');
   for (var i = 0; i < bases.length; i++){
     try{
@@ -1293,17 +1340,25 @@ async function ensureOcrAssets(){
 
     if (!window.ort){
       ocrSetState('加载 onnxruntime-web…');
-      await ocrLoadScriptFromBases('ort.min.js');
+      await ocrLoadScriptFromBases('ort.min.js', function(){ return !!window.ort; });
       if (!window.ort) throw new Error('onnxruntime-web 加载后仍不可用');
     }
-    if (!window.PPOCR){
+    if (ocrEngineMissingApi().length){
+      window.PPOCR = null;                       // 丢掉可能已被旧版脚本占位的对象
       ocrSetState('加载 OCR 引擎…');
-      await ocrLoadScriptFromBases('ocr-engine.js');
-      if (!window.PPOCR) throw new Error('OCR 引擎加载失败');
+      try{
+        await ocrLoadScriptFromBases('ocr-engine.js', function(){ return ocrEngineMissingApi().length === 0; });
+      }catch(e){
+        throw new Error(
+          'OCR 引擎接口不匹配：缺少 ' + ocrEngineMissingApi().join('、') + '。\n' +
+          '加载到的 ocr-engine.js 是旧版（线上回退地址还没更新）。\n' +
+          '处理办法：把最新的 ocr-engine.js 放到本页面同目录，或同步发布到线上后刷新。\n' + e.message
+        );
+      }
     }
     if (!window.PPOCR_CHARSET_B64){
       ocrSetState('加载字符表…');
-      await ocrLoadScriptFromBases('charset.js');
+      await ocrLoadScriptFromBases('charset.js', function(){ return !!window.PPOCR_CHARSET_B64; });
       if (!window.PPOCR_CHARSET_B64) throw new Error('字符表加载失败');
     }
 
@@ -1642,7 +1697,7 @@ async function autoRunAll(){
 
   try{
     await ensureOcrAssets();
-    autoLog('OCR 就绪（' + OCR.threads + ' 线程）· 开始处理 ' + S.pdfs.length + ' 份 PDF', 'ok');
+    autoLog('OCR 就绪（' + OCR.threads + ' 线程 · 引擎来自 ' + (OCR.scriptBase || './') + '）· 开始处理 ' + S.pdfs.length + ' 份 PDF', 'ok');
 
     for (var i = 0; i < S.pdfs.length; i++){
       if (OCR.dlg.stop){ autoLog('⏹ 已手动停止', 'warn'); break; }
