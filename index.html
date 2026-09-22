@@ -409,17 +409,16 @@
             <option value="1800">更高（更慢，小字更稳）</option>
             <option value="1100">更快（大号字名单）</option>
           </select>
-        </label>
-      </div>
+        </label>      </div>
       <p class="auto-tip">
         程序会<b>逐份扫描 PDF</b>：先在文字层里直接找（电子版秒过），找不到就用 OCR 识别后定位姓名，
         自动画框并保存到 <b>合成结果</b>（不建类型子文件夹）。
         识别不到的会标记为「需手动」，跑完后自动跳到那一份，你在右侧手动框一下即可。
       </p>
       <p class="auto-tip" style="margin-top:6px">
-        填了<b>学院关键词</b>会先做一轮<b>快扫</b>：每页只认一部分框（先认长文本抓学院，再认姓名形状顺带碰名字），
-        命中学院后只精查它前后各 2 页，而且<b>快扫时撞到名字就直接定位</b>——页数多的名单能快不少。
-        <b>没填、或没扫到学院</b>时自动退回逐页全扫，结果不受影响。
+        定位顺序：先扫<b>前 5 页</b>（多数材料姓名就在前几页）；还没找到、<b>又填了学院关键词</b>时，
+        再做一轮<b>低分辨率快扫</b>定位「学院」在第几页，把它前后各 2 页提到最前面查，其余页照常补齐——
+        页数多的名单能快不少。<b>没填、或没扫到学院</b>时按页序继续，不影响结果。
       </p>
       <div class="auto-progress">
         <div class="bar"><i id="autoBar"></i></div>
@@ -1452,13 +1451,15 @@ async function renderPageForOcr(num, longSide){
   return cv;
 }
 
-/* ---------- 两级定位：低分辨率快扫学院 → 只精查命中页附近 ---------- */
+/* ---------- 三级策略：前几页精查 → 学院快扫定位 → 候选页优先 ---------- */
 
-var COLLEGE_RADIUS = 2;        // 学院命中页前后各取几页作为候选
-var FAST_LONG_SIDE = 1200;     // 快扫渲染长边（略低于标准，省的主要是渲染时间）
-var FAST_SCAN_MIN_PAGES = 12;  // 少于这个页数直接精查：快扫省下的不够抵消它自己的开销
-var FAST_SCAN_RATIO = 0.4;     // 快扫每页只认这么大比例的框（少量长框抓学院 + 姓名形状框抓名字）
-var COLLEGE_MIN_RATIO = 0.75;  // 模糊匹配阈值：低分辨率 OCR 常有错字，不能只做严格包含
+var DET_SHORT_SIDE = 544;         // 检测输入的短边。PP-OCR 标准是 736，实测降到 544 框位置几乎不变、耗时约省三分之一
+var SCREEN_DET_SHORT_SIDE = 448;  // 学院快扫：只需认出「XX学院」这类大标题，检测可以更粗
+var EARLY_PAGES = 5;              // 先精查前几页（绝大多数材料姓名就在前几页）
+var FAST_LONG_SIDE = 1100;        // 学院快扫的渲染长边
+var SCREEN_LONG_BOXES = 3;        // 快扫每页只认最长的几个框（学院名几乎总在最长的几行里：校名/标题/学院行）
+var COLLEGE_RADIUS = 2;           // 学院命中页前后各取几页作为候选
+var COLLEGE_MIN_RATIO = 0.75;     // 模糊匹配阈值：低分辨率 OCR 常有错字，不能只做严格包含
 
 function itemsJoinedText(items){
   var s = '';
@@ -1502,6 +1503,33 @@ function buildCandidateOrder(hits, totalPages, radius){
   return out;
 }
 
+/** 检测参数：把检测输入限制到指定短边（识别裁剪仍用原画布，清晰度不受影响） */
+function detOpts(cv, shortSide){
+  var mx = PPOCR.detMaxSideFor(cv, shortSide);
+  return mx ? { detMaxSide: mx } : {};
+}
+
+/** 姓名字数（汉字各占 1） */
+function nameCharLen(name){
+  var s = PPOCR.normText(name);
+  return s ? s.length : 3;
+}
+
+/**
+ * 可能构成姓名命中的框。
+ * 用**紧贴框的宽高比（≈ 真实字数）**筛，而不是识别出来的文本 ——
+ * 这样能在识别之前就把「整行项目名、标题、说明段」这类永远不可能命中的宽框剔掉。
+ * 识别耗时 ≈ Σ(裁剪宽度)，剔掉一条 8 字宽的整行 ≈ 省下 3 个姓名框的算力。
+ */
+function nameCandIndices(boxes, tight, name){
+  var n = nameCharLen(name);
+  return PPOCR.nameBoxIndices(boxes, {
+    tight: tight,
+    minChars: 1,          // 保留很短的小框：姓名被检测切成两半时，靠「相邻框拼接」还能救回来
+    maxChars: n + 2.5     // findName 只认「整框相等 / 多 ≤2 字」，所以估字数超过 姓名+2.5 的框必然不可能命中
+  });
+}
+
 async function pagePlainText(doc, num){
   try{
     var pg = await doc.getPage(num);
@@ -1521,17 +1549,32 @@ async function docTextPages(doc, total){
   return arr;
 }
 
-/** 对单页做一次 OCR 找姓名；返回命中详情或 null
- *  加速点：检测出所有框后，先认「形状像姓名」的框（宽度≈2~4 字），命中即停 */
+/**
+ * 对单页做一次 OCR 找姓名；返回命中详情或 null。
+ * 加速点：
+ *   ① 检测输入限到短边 544（PP-OCR 标准输入 736 会白烧算力），识别裁剪仍用原画布 → 检测快约 1.5 倍
+ *   ② 用**紧贴框宽高比（≈ 字数）**先剔掉长行：findName 的三条规则都限长，
+ *      整行/整段永远不可能命中，跳过它们不丢结果却省掉最贵的宽框
+ *   ③ 命中最可能的顺序（≈姓名字数优先，且同批宽度接近）+ 命中即停
+ */
 async function ocrFindNameOnPage(pageNum, longSide){
   var t0 = Date.now();
   var cv = await renderPageForOcr(pageNum, longSide);
-  var d = await PPOCR.detect(cv, {});
-  var order = PPOCR.orderByNameShape(d.boxes);
-  var r = await PPOCR.recognize(cv, d.boxes, order, {
+  var tRender = Date.now() - t0;
+  var t1 = Date.now();
+  var d = await PPOCR.detect(cv, detOpts(cv, DET_SHORT_SIDE));
+  var tDet = Date.now() - t1;
+  var cand = nameCandIndices(d.boxes, d.tight, OCR.dlg.name);
+  if (!cand.length){
+    return null;                      // 整页没有「姓名形状」的框，识别可整段跳过
+  }
+  var t2 = Date.now();
+  var r = await PPOCR.recognize(cv, d.boxes,
+    PPOCR.orderByNameShape(d.boxes, cand, nameCharLen(OCR.dlg.name), d.tight), {
     batchSize: 8,
     onBatch: function(acc){ return !!PPOCR.findName(acc, OCR.dlg.name); }
   });
+  var tRec = Date.now() - t2;
   var hit = PPOCR.findName(r.items, OCR.dlg.name);
   if (!hit) return null;
   return {
@@ -1539,14 +1582,49 @@ async function ocrFindNameOnPage(pageNum, longSide){
     via: 'OCR', kind: hit.kind,
     text: hit.items.map(function(x){ return x.text; }).join('|'),
     score: hit.items[0] ? hit.items[0].score : null,
-    boxes: r.items.length, totalBoxes: d.boxes.length, ms: Math.round(Date.now() - t0)
+    boxes: r.items.length, candBoxes: cand.length, totalBoxes: d.boxes.length,
+    ms: Math.round(Date.now() - t0),
+    split: '渲染 ' + (tRender / 1000).toFixed(1) + 's 检测 ' + (tDet / 1000).toFixed(1) +
+           's 识别 ' + (tRec / 1000).toFixed(1) + 's'
   };
+}
+
+/** 低分辨率快扫：定位「学院」关键词出现在哪些页（每页只认最长的几个框，认到即停） */
+async function collegeScreenPages(from, to, college){
+  if (from > to) return [];
+  autoLog('   · 学院快扫第 ' + from + '~' + to + ' 页（低分辨率检测 + 每页只认最长的 ' +
+          SCREEN_LONG_BOXES + ' 个框）', 'mut');
+  var hits = [], n;
+  for (n = from; n <= to; n++){
+    if (OCR.dlg.stop) throw new Error('__stopped__');
+    try{
+      var cv = await renderPageForOcr(n, FAST_LONG_SIDE);
+      var d = await PPOCR.detect(cv, detOpts(cv, SCREEN_DET_SHORT_SIDE));
+      var idx = PPOCR.orderByLongText(d.boxes).slice(0, SCREEN_LONG_BOXES);
+      var got = false;
+      if (idx.length){
+        await PPOCR.recognize(cv, d.boxes, idx, {
+          batchSize: SCREEN_LONG_BOXES,
+          onBatch: function(acc){
+            if (fuzzyContains(itemsJoinedText(acc), college, COLLEGE_MIN_RATIO)) got = true;
+            return got;
+          }
+        });
+      }
+      if (got) hits.push(n);
+    }catch(e){ /* 单页出错不影响整体，交给后面的逐页精查兜底 */ }
+    if ((n - from + 1) % 15 === 0) autoLog('   · 学院快扫 ' + n + '/' + to + ' 页…', 'mut');
+    await sleep(0);
+  }
+  return hits;
 }
 
 /**
  * 在整份 PDF 里定位姓名。
- * ① 文字层直读（电子版秒过）→ ② 填了学院就先低分辨率快扫定位学院 → ③ 只精查候选页；
- *    没填学院 / 没扫到学院 → 退回逐页全扫，结果不受影响。
+ * ① 文字层直读（电子版秒过，有学院关键词时顺便用来重排页序）
+ * ② 先精查前 EARLY_PAGES 页 —— 绝大多数材料的姓名就在前几页，这里命中就是最快路径
+ * ③ 还很长且填了学院 → 低分辨率快扫定位学院页，把「它前后各 2 页」提到最前面
+ * ④ 按 ③④ 的顺序精查完剩余页（候选优先，其余补齐，保证不漏）
  */
 async function locateNameInDoc(p){
   var total = p.total, name = OCR.dlg.name, college = OCR.dlg.college;
@@ -1555,91 +1633,74 @@ async function locateNameInDoc(p){
   /* ① 文字层：电子版几乎零成本，整篇文本一次拉完 */
   var texts = await docTextPages(S.doc, total);
   if (texts){
-    var order = [];
+    var tlOrder = [];
     if (college){
       var ch = [];
       for (n = 1; n <= total; n++){ if (fuzzyContains(texts[n - 1], college, COLLEGE_MIN_RATIO)) ch.push(n); }
       if (ch.length){
-        order = buildCandidateOrder(ch, total, COLLEGE_RADIUS);
-        note.push('文字层学院命中 ' + ch.length + ' 页 → 先看 ' + order.length + ' 页');
+        tlOrder = buildCandidateOrder(ch, total, COLLEGE_RADIUS);
+        note.push('文字层学院命中 ' + ch.length + ' 页');
       }
     }
-    if (!order.length){ for (n = 1; n <= total; n++) order.push(n); }
-    for (var i1 = 0; i1 < order.length; i1++){
-      var tl = await textLayerFind(await S.doc.getPage(order[i1]), name);
-      if (tl) return { page: order[i1], rect: PPOCR.padRect(tl), via: '文字层', note: note.join('；') || '文字层直读' };
+    if (!tlOrder.length){ for (n = 1; n <= total; n++) tlOrder.push(n); }
+    for (var i1 = 0; i1 < tlOrder.length; i1++){
+      var tl = await textLayerFind(await S.doc.getPage(tlOrder[i1]), name);
+      if (tl) return { page: tlOrder[i1], rect: PPOCR.padRect(tl), via: '文字层', note: note.join('；') || '文字层直读' };
     }
     note.push('文字层无此姓名');
   }
 
-  /* ② 学院快扫：每页只认一部分框（长文本优先抓学院，其次姓名形状顺带抓名字） */
-  var collegeHits = null, candidates = null;
-  if (college && total >= FAST_SCAN_MIN_PAGES){
-    autoLog('   · 学院快扫「' + college + '」（' + total + ' 页，每页先认长框抓学院、再认姓名框碰运气）', 'mut');
-    var hits = [], quickName = null;
-    var BATCH = 8;
-    for (n = 1; n <= total; n++){
-      if (OCR.dlg.stop) throw new Error('__stopped__');
-      var cv = await renderPageForOcr(n, FAST_LONG_SIDE);
-      var d = await PPOCR.detect(cv, {});
-      var gotName = false, gotCollege = false;
-      await PPOCR.recognize(cv, d.boxes, PPOCR.orderMixed(d.boxes, FAST_SCAN_RATIO), {
-        batchSize: BATCH,
-        onBatch: function(acc){
-          if (!gotName && PPOCR.findName(acc, name)) gotName = true;
-          if (!gotCollege && fuzzyContains(itemsJoinedText(acc), college, COLLEGE_MIN_RATIO)) gotCollege = true;
-          return gotName || gotCollege;   // 命中任一即停
-        }
-      });
-      if (gotCollege) hits.push(n);
-      if (gotName && quickName === null) quickName = n;
-      await sleep(0);
-    }
-    if (hits.length){
-      collegeHits = hits;
-      candidates = buildCandidateOrder(hits, total, COLLEGE_RADIUS);
-      note.push('学院命中第 ' + hits.join('、') + ' 页 → 精查 ' + candidates.length + ' 页');
-      autoLog('   · 学院命中 ' + hits.length + ' 页（' + hits.join('、') + '）→ 精查 ' + candidates.length + ' 页', 'ok');
+  var finish = function(res){
+    res.note = note.join('；') || res.note || '逐页命中';
+    return res;
+  };
+
+  /* ② 先精查前几页 */
+  var firstRun = Math.min(total, EARLY_PAGES);
+  for (n = 1; n <= firstRun; n++){
+    if (OCR.dlg.stop) throw new Error('__stopped__');
+    var pt = Date.now();
+    var r0 = await ocrFindNameOnPage(n, OCR.dlg.longSide);
+    if (r0){ r0.note = note.concat(['第 ' + n + ' 页命中']).join('；'); return r0; }
+    if (total > 3) autoLog('   · 第 ' + n + '/' + total + ' 页未命中（' + ((Date.now() - pt) / 1000).toFixed(1) + 's）', 'mut');
+  }
+
+  /* ③ 剩下还很长 + 填了学院 → 快扫定位学院页，候选提前 */
+  var candidates = null, collegeHits = null;
+  if (college && total > firstRun + 1){
+    collegeHits = await collegeScreenPages(firstRun + 1, total, college);
+    if (collegeHits.length){
+      candidates = buildCandidateOrder(collegeHits, total, COLLEGE_RADIUS).filter(function(pg){ return pg > firstRun; });
+      note.push('学院命中第 ' + collegeHits.join('、') + ' 页');
+      autoLog('   · 学院命中第 ' + collegeHits.join('、') + ' 页 → 优先精查它附近 ' + candidates.length + ' 页', 'ok');
     } else {
-      note.push('未扫到学院 → 逐页全扫');
-      autoLog('   · 未扫到学院，改为逐页全扫', 'mut');
-    }
-    // 快扫顺带看到了姓名 → 用正常精度重扫这一页取准坐标
-    if (quickName){
-      var q = await ocrFindNameOnPage(quickName, OCR.dlg.longSide);
-      if (q){
-        q.note = note.join('；') + '；快扫顺带命中';
-        q.collegeHits = collegeHits; q.candidatePages = candidates ? candidates.length : total;
-        return q;
-      }
+      autoLog('   · 学院快扫没扫到，按页序继续', 'mut');
     }
   }
 
-  /* ③ 精查：候选页优先；候选里没有就把其余页补扫完，保证不漏 */
-  var order2 = [], candSet = {};
-  if (candidates && candidates.length){
-    for (var c1 = 0; c1 < candidates.length; c1++){ candSet[candidates[c1]] = 1; order2.push(candidates[c1]); }
-    for (n = 1; n <= total; n++){ if (!candSet[n]) order2.push(n); }
-  } else {
-    for (n = 1; n <= total; n++) order2.push(n);
+  /* ④ 精查：候选页优先，其余按页序补齐 */
+  var order = [], seen = {}, i2, pn;
+  if (candidates){
+    for (i2 = 0; i2 < candidates.length; i2++){ order.push(candidates[i2]); seen[candidates[i2]] = 1; }
   }
-  var inCandidate = true;
-  for (var i2 = 0; i2 < order2.length; i2++){
+  for (pn = firstRun + 1; pn <= total; pn++){ if (!seen[pn]) order.push(pn); }
+
+  var inCandidate = !!(candidates && candidates.length);
+  for (i2 = 0; i2 < order.length; i2++){
     if (OCR.dlg.stop) throw new Error('__stopped__');
-    var pn = order2[i2];
-    if (candidates && candidates.length && !candSet[pn] && inCandidate){
-      inCandidate = false;
-      autoLog('   · 候选页都没找到，补扫其余 ' + (order2.length - i2) + ' 页', 'mut');
-    }
-    var pt = Date.now();
+    pn = order[i2];
+    if (inCandidate && !seen[pn]){ inCandidate = false; }
+    var t2 = Date.now();
     var res = await ocrFindNameOnPage(pn, OCR.dlg.longSide);
     if (res){
-      res.note = note.join('；') || (candidates ? '学院筛选后命中' : '逐页命中');
       res.collegeHits = collegeHits;
-      res.candidatePages = order2.length;
-      return res;
+      res.candidatePages = candidates ? candidates.length : 0;
+      return finish(res);
     }
-    if (total > 3) autoLog('   · 第 ' + pn + '/' + total + ' 页未命中（' + ((Date.now() - pt) / 1000).toFixed(1) + 's）', 'mut');
+    if (total > 3){
+      autoLog('   · 第 ' + pn + '/' + total + ' 页未命中（' + ((Date.now() - t2) / 1000).toFixed(1) + 's）',
+              inCandidate ? 'mut' : '');
+    }
   }
   return null;
 }
@@ -1698,6 +1759,10 @@ async function autoRunAll(){
   try{
     await ensureOcrAssets();
     autoLog('OCR 就绪（' + OCR.threads + ' 线程 · 引擎来自 ' + (OCR.scriptBase || './') + '）· 开始处理 ' + S.pdfs.length + ' 份 PDF', 'ok');
+    if (OCR.threads <= 1 && location.protocol === 'file:'){
+      autoLog('提示：双击打开（file://）浏览器不允许开多线程，推理只能单核跑，速度大约减半。' +
+              '想要更快，用「本地静态服务器」或在线版打开同一个 html 即可（只影响速度，不影响识别结果）。', 'warn');
+    }
 
     for (var i = 0; i < S.pdfs.length; i++){
       if (OCR.dlg.stop){ autoLog('⏹ 已手动停止', 'warn'); break; }
@@ -1750,7 +1815,9 @@ async function autoRunAll(){
         p.savedType = NO_TYPE;
         p.existingIn = NO_TYPE;
         okCount++;
-        var extra = found.via === 'OCR' ? '（OCR 扫描 ' + found.boxes + ' 框 / 共 ' + found.totalBoxes + '）' : '（文字层直读）';
+        var extra = found.via === 'OCR'
+          ? '（OCR：候选框 ' + found.candBoxes + '/' + found.totalBoxes + ' 个 · ' + found.split + '）'
+          : '（文字层直读）';
         if (found.note) extra += ' · ' + found.note;
         autoLog('   ✔ 姓名在第 ' + found.page + ' 页 ' + extra + ' → ' + OUT_FOLDER + '/' + fname, 'ok');
       }catch(e){

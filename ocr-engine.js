@@ -25,7 +25,9 @@ var PPOCR = (function () {
     MAX_CAND: 1000
   };
 
-  var REC = { H: 48, BASE_W: 320, MAX_W: 1600, BATCH: 6 };
+  /* BASE_W 是旧版的固定裁剪宽度：以前每批都按 320 宽算，等于白烧 2~3 倍算力，
+   * 现已改为「按批内最宽框的自然比例」，所以这里只作为历史参数保留。 */
+  var REC = { H: 48, BASE_W: 320, MIN_W: 96, PAD_W: 8, MAX_W: 1600, BATCH: 6 };
 
   var ort = null;
   var detSession = null;
@@ -129,16 +131,23 @@ var PPOCR = (function () {
   /* -------------------------------------------------------- 检测 前 / 后 */
 
   function detPreprocess(srcCanvas, maxSide) {
-    var w = srcCanvas.width, h = srcCanvas.height;
+    var baseW = srcCanvas.width, baseH = srcCanvas.height;
+    var w = baseW, h = baseH;
     var src = srcCanvas;
+    var capped = false;
     if (maxSide && Math.max(w, h) > maxSide) {
       var k = maxSide / Math.max(w, h);
       src = resizeCanvas(srcCanvas, Math.round(w * k), Math.round(h * k));
       w = src.width; h = src.height;
+      capped = true;
     }
+    /* 短边不足 LIMIT_SIDE 时放大补足；但若调用方已主动限过最长边，
+     * 就不再反着放大——否则「降到 560 短边」这类更省的请求会被弹回 736。 */
     var ratio = 1;
-    var shortSide = Math.min(h, w);
-    if (shortSide < DET.LIMIT_SIDE) ratio = DET.LIMIT_SIDE / shortSide;
+    if (!capped) {
+      var shortSide = Math.min(h, w);
+      if (shortSide < DET.LIMIT_SIDE) ratio = DET.LIMIT_SIDE / shortSide;
+    }
     var rh = Math.max(32, Math.round(Math.round(h * ratio) / 32) * 32);
     var rw = Math.max(32, Math.round(Math.round(w * ratio) / 32) * 32);
 
@@ -153,7 +162,9 @@ var PPOCR = (function () {
       data[n + i]     = (px[p + 1] * s - m) / d;
       data[2 * n + i] = (px[p + 2] * s - m) / d;
     }
-    return { data: data, rw: rw, rh: rh, ow: w, oh: h, scaled: w !== srcCanvas.width };
+    /* ow/oh 始终是**原画布**尺寸：识别裁剪用的是原画布，
+     * 因此检测框必须映射回原画布坐标（否则限制最长边后框会整体偏小）。 */
+    return { data: data, rw: rw, rh: rh, ow: baseW, oh: baseH, detW: w, detH: h, scaled: capped };
   }
 
   /* 简化版 DB 后处理：连通域 → 轴对齐外接框 → 等距外扩。
@@ -185,7 +196,7 @@ var PPOCR = (function () {
     // 8 连通标记 + 统计
     var label = new Int32Array(n);
     var stack = new Int32Array(n);
-    var boxes = [], scores = [], lab = 0;
+    var boxes = [], tights = [], scores = [], lab = 0;
 
     for (var start = 0; start < n; start++) {
       if (!dil[start] || label[start]) continue;
@@ -234,6 +245,14 @@ var PPOCR = (function () {
       if (Math.min(x1 - x0, y1 - y0) < DET.MIN_SIZE + 2) continue;
 
       var sx = ow / rw, sy = oh / rh;
+      /* 紧贴框（外扩前）：宽高比 ≈ 真实字数。
+       * 外扩量 = 面积×1.6/周长，对小框的高度放大量远大于宽度，
+       * 会把宽高比整体压向 2~5 —— 于是「7 个字的加分项目」估出来只有 4，
+       * 用外扩框估字数几乎分不出「姓名」和「一整行内容」。紧贴框才能。
+       * 识别裁剪仍用外扩框（照旧，留白对识别有利）。 */
+      var tx0 = Math.max(0, Math.round(minx * sx)), ty0 = Math.max(0, Math.round(miny * sy));
+      var tx1 = Math.min(ow, Math.round((maxx + 1) * sx)), ty1 = Math.min(oh, Math.round((maxy + 1) * sy));
+
       x0 = Math.max(0, Math.round(x0 * sx));
       y0 = Math.max(0, Math.round(y0 * sy));
       x1 = Math.min(ow, Math.round(x1 * sx));
@@ -241,18 +260,25 @@ var PPOCR = (function () {
       if (x1 - x0 <= 3 || y1 - y0 <= 3) continue;
 
       boxes.push([x0, y0, x1, y1]);
+      tights.push([tx0, ty0, tx1, ty1]);
       scores.push(score);
       if (boxes.length >= DET.MAX_CAND) break;
     }
-    return { boxes: boxes, scores: scores };
+    return { boxes: boxes, tight: tights, scores: scores };
   }
 
   /* -------------------------------------------------------- 识别 前 / 后 */
 
-  /* 一个批次内所有文本框共用同一宽度裁剪尺寸，一次前向搞定，省掉逐框调用开销 */
+  /* 一个批次内所有文本框共用同一宽度裁剪尺寸，一次前向搞定，省掉逐框调用开销。
+   *
+   * 裁剪宽度按**批内最宽框的自然比例**取，不再固定 320：
+   * 缩放到高 48 后宽度 = 48×(宽/高)，不足 imgW 的部分右侧补灰（归一化后为 0），
+   * 这正是 PaddleOCR 的做法 —— 所以只要 imgW ≥ 自然宽，识别结果**逐位相同**，
+   * 而张量宽度可以从 320 降到 96~200，识别耗时按宽度线性下降（识别是按批算的，
+   * 之前无论框多窄都按 320 算，等于白烧 2~3 倍算力）。 */
   function recPrepareBatch(srcCanvas, boxes, idxs) {
     var n = idxs.length;
-    var maxWhRatio = REC.BASE_W / REC.H;
+    var maxWhRatio = 0;
     var k, box, w, h, ratio;
     for (k = 0; k < n; k++) {
       box = boxes[idxs[k]];
@@ -261,7 +287,8 @@ var PPOCR = (function () {
       ratio = w / h;
       if (ratio > maxWhRatio) maxWhRatio = ratio;
     }
-    var imgW = Math.min(REC.MAX_W, Math.floor(REC.H * maxWhRatio));
+    var natural = Math.ceil(REC.H * maxWhRatio) + REC.PAD_W;
+    var imgW = Math.min(REC.MAX_W, Math.max(REC.MIN_W, natural));
     var plane = REC.H * imgW;
     var data = new Float32Array(n * 3 * plane);
 
@@ -333,7 +360,7 @@ var PPOCR = (function () {
     var detOut = await detSession.run(feeds);
     var probTensor = detOut[detSession.outputNames[0]] || detOut[Object.keys(detOut)[0]];
     var d = detPostprocess(probTensor.data, pre.rw, pre.rh, pre.ow, pre.oh);
-    return { boxes: d.boxes, scores: d.scores, ms: now() - t0 };
+    return { boxes: d.boxes, tight: d.tight, scores: d.scores, ms: now() - t0 };
   }
 
   /**
@@ -408,20 +435,108 @@ var PPOCR = (function () {
     return hs.length ? hs[(hs.length / 2) | 0] : 12;
   }
 
-  /** 姓名形状优先：按「宽度 ≈ 2~4 个字」的程度排序，最像的先认 */
-  function orderByNameShape(boxes) {
-    var med = medianHeights(boxes), i;
-    var idx = [];
-    for (i = 0; i < boxes.length; i++) idx.push(i);
-    idx.sort(function (a, b) {
-      var wa = (boxes[a][2] - boxes[a][0]) / med;
-      var wb = (boxes[b][2] - boxes[b][0]) / med;
-      // 目标 ≈3 字宽（2~4 个汉字）；同分时按页面中位置从上到下
-      var sa = Math.abs(wa - 3), sb = Math.abs(wb - 3);
-      if (Math.abs(sa - sb) > 0.15) return sa - sb;
-      return boxes[a][1] - boxes[b][1];
+  /** 取「用来估字数的框」：优先用紧贴框（外扩前的原框） */
+  function shapeSource(boxes, tight) {
+    return (tight && tight.length === boxes.length) ? tight : boxes;
+  }
+
+  /** 估算字数：紧贴框的 宽/高。汉字近似方形，所以这个比值 ≈ 字数，且与字号无关
+   *  （用「宽 / 本页中位高」会被混排字号带偏，用「宽 / 自身高」才稳） */
+  function estChars(src, i) {
+    var b = src[i];
+    return (b[2] - b[0]) / Math.max(1, b[3] - b[1]);
+  }
+
+  /**
+   * 姓名形状优先，并让「同一批识别的框宽度接近」。
+   *
+   * 为什么按「字数分桶」排，而不是直接按 |宽 - 目标| 排：
+   * recognize 一个批次共用同一裁剪宽度（取批内最大值），批内混进一个宽框整批都按它算。
+   * 而 |1-3| == |5-3|，「1 个字」和「5 个字」会被排到相邻 —— 白多算 5 倍。
+   * 分桶后批内宽度只差一档；桶与桶之间仍按「离姓名字数由近到远」，命中即停不受影响。
+   *
+   * @param subset 只对这些索引排序（不传 = 全部）
+   * @param targetRatio 目标字数（= 姓名字数），默认 3
+   * @param tight 紧贴框（可选；有它时用紧贴框估字数，更准）
+   */
+  function orderByNameShape(boxes, subset, targetRatio, tight) {
+    var tgt = targetRatio || 3;
+    var src = shapeSource(boxes, tight), i;
+    var idx = subset ? subset.slice() : [];
+    if (!subset) for (i = 0; i < boxes.length; i++) idx.push(i);
+
+    var groups = {}, keys = [];
+    for (i = 0; i < idx.length; i++) {
+      var k = Math.max(1, Math.round(estChars(src, idx[i])));
+      if (!groups[k]) { groups[k] = []; keys.push(k); }
+      groups[k].push(idx[i]);
+    }
+    keys.sort(function (a, b) {
+      var da = Math.abs(a - tgt), db = Math.abs(b - tgt);
+      return da !== db ? da - db : a - b;
     });
-    return idx;
+    var out = [];
+    for (i = 0; i < keys.length; i++) {
+      var g = groups[keys[i]];
+      g.sort(function (a, b) { return boxes[a][1] - boxes[b][1] || boxes[a][0] - boxes[b][0]; });
+      for (var m = 0; m < g.length; m++) out.push(g[m]);
+    }
+    return out;
+  }
+
+  /**
+   * 只挑「可能构成姓名命中」的框。
+   *
+   * 依据：findName 的三条命中规则都要求识别文本与姓名长度相近
+   * （整框相等 / 只多 2 个字 / 相邻框拼接后只多 4 个字），
+   * 所以**长行（整行标题、整段说明）永远不可能命中**。
+   * 跳过它们不损失任何结果，却能省掉识别成本最高的宽框
+   * —— 识别耗时 ≈ Σ(裁剪宽度)，一条 8 字宽的整行 ≈ 3 个姓名框。
+   *
+   * 判断必须用**紧贴框的宽高比**（≈ 真实字数），不能用外扩框：
+   * 外扩量 = 面积×1.6/周长，对小框的高度放大量远大于宽度，
+   * 会把宽高比整体压向 2~5 —— 「7 个字的加分项目」估出来只有 4，
+   * 于是被当成候选框白认一遍（这正是之前慢的主因）。
+   *
+   * @param opts.maxChars 允许的最大估算字数（建议 = 姓名字数 + 2）
+   * @param opts.minChars 允许的最小估算字数，默认 1
+   * @param opts.tight    detect 返回的紧贴框（与外扩框同序）
+   */
+  function nameBoxIndices(boxes, opts) {
+    opts = opts || {};
+    var maxChars = opts.maxChars || 8;
+    var minChars = opts.minChars || 1;
+    var minH = opts.minHeight || 6;
+    var src = shapeSource(boxes, opts.tight);
+    var out = [];
+    for (var i = 0; i < boxes.length; i++) {
+      var b = src[i];
+      var w = b[2] - b[0], h = b[3] - b[1];
+      if (w < 4 || h < minH) continue;
+      var est = estChars(src, i);
+      if (est > maxChars || est < minChars) continue;
+      out.push(i);
+    }
+    return out;
+  }
+
+  /** 直接给出「姓名候选框」的识别顺序（已过滤 + 已按姓名形状分桶排序） */
+  function orderNameCandidates(boxes, opts) {
+    opts = opts || {};
+    return orderByNameShape(boxes, nameBoxIndices(boxes, opts), opts.targetRatio, opts.tight);
+  }
+
+  /**
+   * 让检测输入的短边 ≈ targetShort，返回该传给 detect 的 detMaxSide（0 = 不限制）。
+   * 检测分辨率与识别裁剪用的画布分辨率是两件事：画布要清晰（给识别裁图），
+   * 检测按 PP-OCR 的标准输入（短边 736）就够，喂更大只是白烧算力。
+   */
+  function detMaxSideFor(canvas, targetShort) {
+    var lim = targetShort || DET.LIMIT_SIDE;
+    var mx = Math.max(canvas.width, canvas.height), mn = Math.min(canvas.width, canvas.height);
+    if (!(mx > 0) || !(mn > 0)) return 0;
+    if (mn <= lim) return 0;                  // 画布本来就够小，走「短边补足」逻辑
+    return Math.round(mx * lim / mn);
   }
 
   /** 长文本优先：学院名、标题这类长串先认 */
@@ -493,10 +608,18 @@ var PPOCR = (function () {
       }
     }
 
+    /* 下面的拼接规则要求「相邻」是**空间相邻**（阅读顺序），
+     * 而 items 的顺序是识别顺序（会被「按形状分桶」打乱），所以显式按 (行, 列) 排一次 */
+    clean.sort(function (a, b) {
+      if (Math.abs(a.it.y0 - b.it.y0) > 4) return a.it.y0 - b.it.y0;
+      return a.it.x0 - b.it.x0;
+    });
+
     for (var a = 0; a < clean.length; a++) {
       var joined = clean[a].t;
       var list = [clean[a].it];
       for (var b = a + 1; b < Math.min(a + 4, clean.length); b++) {
+        if (!sameLine(clean[a].it, clean[b].it)) break;   // 只拼同一行，避免「上一行末字 + 下一行首字」凑出姓名
         joined += clean[b].t;
         list.push(clean[b].it);
         if (joined.length > target.length + maxExtra * 3) break;
@@ -506,6 +629,13 @@ var PPOCR = (function () {
       }
     }
     return null;
+  }
+
+  /** 两个识别框是否大致在同一行（竖向中心差不超过较高者的 0.8 倍） */
+  function sameLine(a, b) {
+    var ha = Math.abs(a.y1 - a.y0), hb = Math.abs(b.y1 - b.y0);
+    var ca = (a.y0 + a.y1) / 2, cb = (b.y0 + b.y1) / 2;
+    return Math.abs(ca - cb) <= 0.8 * Math.max(ha, hb, 1);
   }
 
   /** 命中结果 → 归一化矩形 [x0,y0,x1,y1] */
@@ -536,6 +666,9 @@ var PPOCR = (function () {
     recognize: recognize,
     runPage: runPage,
     orderByNameShape: orderByNameShape,
+    orderNameCandidates: orderNameCandidates,
+    nameBoxIndices: nameBoxIndices,
+    detMaxSideFor: detMaxSideFor,
     orderByLongText: orderByLongText,
     orderMixed: orderMixed,
     findName: findName,
