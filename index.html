@@ -1192,7 +1192,7 @@ var OCR_BASES = [
 
 /* 脚本版本号：只加在 http(s) 的 .js 上，用来击穿浏览器 / CDN 的旧缓存。
  * 以后改了脚本想立刻生效，把这个串改一下即可（20MB 模型不受影响，照旧走缓存）。 */
-var OCR_SCRIPT_VER = '20260921';
+var OCR_SCRIPT_VER = '20260922';
 
 var OCR = {
   ready: false,
@@ -1325,6 +1325,22 @@ async function ocrLoadBinaryFromBases(file){
   throw new Error('加载 ' + file + ' 失败，已尝试：\n' + errs.join('\n'));
 }
 
+/* 多线程预检：起一个 module Worker 试加载 url。
+ * ort 的 .mjs 是 MODULARIZE 工厂，作为普通 Worker 顶层执行时只定义导出、不跑推理，
+ * 因此「3 秒内无 onerror」即可认为 Worker 脚本可正常加载。 */
+function ocrMultithreadProbe(url){
+  return new Promise(function(resolve){
+    var done = false;
+    function finish(v){ if (done) return; done = true; try{ w && w.terminate(); }catch(e){} resolve(v); }
+    var w = null;
+    try{
+      w = new Worker(url, { type: 'module' });
+      w.onerror = function(){ finish(false); };
+      setTimeout(function(){ finish(true); }, 3000);
+    }catch(e){ finish(false); }
+  });
+}
+
 function ocrSetState(text, cls){
   var el = $('autoOcrState');
   if (el){ el.className = 'muted' + (cls ? ' ' + cls : ''); el.textContent = text; }
@@ -1381,7 +1397,7 @@ async function ensureOcrAssets(){
 
     OCR.ready = true;
     OCR.threads = threads;
-    ocrSetState('OCR 就绪 · ' + threads + ' 线程 · ' + info.classes + ' 字符', 'ok');
+    ocrSetState('OCR 就绪 · ' + threads + ' 线程 · ' + info.classes + ' 字符' + (threads === 1 && window.crossOriginIsolated === true ? '（多线程不可用，已回退单线程）' : ''), 'ok');
   } finally {
     OCR.loading = false;
   }
